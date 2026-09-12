@@ -16,7 +16,8 @@ ALS_RNAseq/
 ├── docs/
 │   └── methods.md                        # pipeline description, reproducibility notes
 ├── config/
-│   ├── als_dataset_syn_ids.yml            # Synapse IDs per dataset (samplesheet, output folder)
+│   ├── als_dataset_syn_ids.yml            # Synapse IDs: per-dataset samplesheet/output folder,
+│   │                                       #   plus split_merged_matrics_by_study.py's inputs
 │   └── pipeline_config.yml                # AWS profile, S3 bucket, per-dataset staging keys
 ├── scripts/
 │   └── 01_alignment/                     # nf-core/rnaseq alignment + quantification
@@ -25,10 +26,6 @@ ALS_RNAseq/
 │       ├── als_rnaseq_params.json        # nf-core/rnaseq science params
 │       └── nextflow-rnaseq.config        # Nextflow/Tower infra config
 │   # 02_qc/ and 03_normalization/ planned
-├── samplesheets/
-│   ├── dataset_targets.csv
-│   ├── samplesheet.csv
-│   └── samplesheet_with_dataset_names.csv
 └── data/                                  # local working files (gitignored, not committed)
     ├── rsem_merged_tsv/                   # merged RSEM matrices downloaded from the pipeline run
     └── per_study/                         # per-study matrices produced by the split step
@@ -58,24 +55,9 @@ Planned next: `scripts/02_qc/` (post-alignment QC) and
 
 ## Samplesheets
 
-### `dataset_targets.csv`
-
-Targets file listing the ALS bulk RNA-seq datasets selected from the Synapse
-DatasetCollection, along with their Synapse dataset IDs and targeted FASTQ
-subfolder IDs.
-
-Columns: `dataset_name`, `dataset_synid`, `fastq_folder_synid`
-
-### `samplesheet.csv`
-
-nf-core/rnaseq samplesheet with FASTQ files referenced by Synapse ID.
-
-Columns: `sample`, `single_end`, `fastq_1`, `fastq_2`, `strandedness`
-
-### `samplesheet_with_dataset_names.csv`
-
-Same as `samplesheet.csv` with an additional `dataset` column identifying the
-source dataset for each sample. Used by `split_merged_matrics_by_study.py` to
-map samples back to their study.
-
-Columns: `sample`, `single_end`, `fastq_1`, `fastq_2`, `strandedness`, `dataset`
+Not committed to this repo -- Synapse is the source of truth. `als_samplesheet.csv`
+(referenced by `config/als_dataset_syn_ids.yml`'s `samplesheet_id`) is fetched
+by `orca_rnaseq_workflow.py` at run time; `dataset_targets.csv` and
+`samplesheet_with_dataset_names.csv` (referenced by the same config file's
+`split_matrices_inputs`) are fetched by `split_merged_matrics_by_study.py`
+and cached under `data/` on first use.

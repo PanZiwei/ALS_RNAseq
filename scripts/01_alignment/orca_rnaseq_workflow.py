@@ -104,7 +104,8 @@ async def main():
     parser.add_argument(
         '--tier', action='append',
         choices=sorted({tier_name for tier_name, *_ in SYNINDEX_TIERS}),
-        help="Restrict the synindex step to one tier from SYNINDEX_TIERS "
+        help="synindex step ONLY -- ignored for fetch_samplesheet/synstage/"
+             "rnaseq. Restricts synindex to one tier from SYNINDEX_TIERS "
              "(repeatable, e.g. --tier tier1 --tier tier3). Default: all tiers.",
     )
     args = parser.parse_args()

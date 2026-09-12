@@ -14,18 +14,52 @@ Usage:
   python split_merged_matrics_by_study.py split upload --upload-parent synXXXXXXX
 
 The merged matrices are expected to be already downloaded into --data-dir.
+
+samplesheet_with_dataset_names.csv and dataset_targets.csv are not committed
+to this repo -- Synapse is their source of truth (see
+config/als_dataset_syn_ids.yml's split_matrices_inputs). They're downloaded
+into --data-dir on first use and cached there; delete the cached copy to
+force a re-download if the Synapse files change.
 """
 import argparse
 import csv
 import sys
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).parent.parent.parent
-SAMPLESHEET_WITH_DATASET = REPO_ROOT / "samplesheets" / "samplesheet_with_dataset_names.csv"
-DATASET_TARGETS = REPO_ROOT / "samplesheets" / "dataset_targets.csv"
+CONFIG = yaml.safe_load((REPO_ROOT / "config" / "als_dataset_syn_ids.yml").read_text())
+SPLIT_INPUTS = CONFIG["split_matrices_inputs"]
 
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "rsem_merged_tsv"
 DEFAULT_OUT_DIR = REPO_ROOT / "data" / "per_study"
+
+
+def _fetch_from_synapse(synapse_id: str, filename: str, data_dir: Path) -> Path:
+    """Download a file from Synapse into data_dir, caching it there.
+
+    Arguments:
+        synapse_id: The Synapse ID of the file to download
+        filename: Local filename to cache it as, under data_dir
+        data_dir: Directory to cache the downloaded file in
+
+    Returns:
+        Path to the (possibly cached) local file
+    """
+    local_path = data_dir / filename
+    if local_path.exists():
+        return local_path
+
+    import synapseclient
+    from synapseclient.operations import get as syn_get
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    syn = synapseclient.Synapse()
+    syn.login(silent=True)
+    downloaded = syn_get(synapse_id, synapse_client=syn)
+    local_path.write_bytes(Path(downloaded.path).read_bytes())
+    return local_path
 
 MATRIX_FILES = [
     "rsem.merged.gene_counts.tsv",
@@ -36,24 +70,18 @@ MATRIX_FILES = [
 
 EXPECTED_SAMPLES = 1794
 
-# Short filename slug per study. Keyed by dataset_synid rather than by the
-# dataset title so a title edit in dataset_targets.csv can't silently rename
-# output files; _load_studies() asserts these keys match that file exactly.
-STUDY_KEYWORDS = {
-    "syn67729513": "c9orf72_sals_ftd",
-    "syn67719824": "grn_ftd",
-    "syn67754663": "tdp43_line_retrotransposon",
-    "syn67737779": "als_cortex_subtypes",
-    "syn67743547": "c9orf72_neuron_glia",
-    "syn68932658": "rna_methylation_tdp43",
-    "syn67733559": "truncated_stathmin2",
-}
+# Short filename slug per study -- see config/als_dataset_syn_ids.yml's
+# split_matrices_inputs.study_keywords for the values and rationale.
+STUDY_KEYWORDS = SPLIT_INPUTS["study_keywords"]
 
 
-def _load_studies() -> dict[str, str]:
+def _load_studies(data_dir: Path) -> dict[str, str]:
     """dataset_synid -> dataset_name, validated against STUDY_KEYWORDS."""
+    dataset_targets = _fetch_from_synapse(
+        SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", data_dir
+    )
     studies = {}
-    with open(DATASET_TARGETS) as f:
+    with open(dataset_targets) as f:
         for row in csv.DictReader(f):
             studies[row["dataset_synid"]] = row["dataset_name"]
     if set(studies) != set(STUDY_KEYWORDS):
@@ -64,15 +92,23 @@ def _load_studies() -> dict[str, str]:
     return studies
 
 
-def build_sample_to_study() -> dict[str, str]:
+def build_sample_to_study(data_dir: Path) -> dict[str, str]:
     """Map each sample to its study_id, via dataset_name as the join key."""
+    dataset_targets = _fetch_from_synapse(
+        SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", data_dir
+    )
+    samplesheet_with_dataset = _fetch_from_synapse(
+        SPLIT_INPUTS["samplesheet_with_dataset_names_id"],
+        "samplesheet_with_dataset_names.csv", data_dir,
+    )
+
     name_to_synid = {}
-    with open(DATASET_TARGETS) as f:
+    with open(dataset_targets) as f:
         for row in csv.DictReader(f):
             name_to_synid[row["dataset_name"]] = row["dataset_synid"]
 
     sample_to_study = {}
-    with open(SAMPLESHEET_WITH_DATASET) as f:
+    with open(samplesheet_with_dataset) as f:
         for row in csv.DictReader(f):
             study_id = name_to_synid[row["dataset"]]
             sample_to_study[row["sample"]] = study_id
@@ -136,7 +172,7 @@ def split_matrix(local_path: Path, sample_to_study: dict[str, str], out_dir: Pat
 # -- steps --------------------------------------------------------------------
 
 def cmd_split(args) -> None:
-    sample_to_study = build_sample_to_study()
+    sample_to_study = build_sample_to_study(args.data_dir)
     for filename in MATRIX_FILES:
         local_path = args.data_dir / filename
         if not local_path.exists():
@@ -153,7 +189,7 @@ def cmd_upload(args) -> None:
     import synapseclient
     from synapseclient import File, Folder
 
-    studies = _load_studies()
+    studies = _load_studies(args.data_dir)
     syn = synapseclient.Synapse()
     syn.login(silent=True)
 
@@ -184,9 +220,9 @@ def cmd_upload(args) -> None:
 
 # -- checks -------------------------------------------------------------------
 
-def _self_check() -> None:
-    studies = _load_studies()
-    sample_to_study = build_sample_to_study()
+def _self_check(data_dir: Path) -> None:
+    studies = _load_studies(data_dir)
+    sample_to_study = build_sample_to_study(data_dir)
     assert len(sample_to_study) == EXPECTED_SAMPLES, (
         f"expected {EXPECTED_SAMPLES} samples, got {len(sample_to_study)}"
     )
@@ -209,7 +245,7 @@ def _end_to_end_test(args) -> None:
     from collections import Counter
     import pandas as pd
 
-    sample_to_study = build_sample_to_study()
+    sample_to_study = build_sample_to_study(args.data_dir)
     out_dir = Path("/tmp/merged_matrices_test")
 
     filename = "rsem.merged.gene_counts.tsv"  # smallest of the 4
@@ -263,7 +299,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.check:
-        _self_check()
+        _self_check(args.data_dir)
         return
     if args.test:
         _end_to_end_test(args)
