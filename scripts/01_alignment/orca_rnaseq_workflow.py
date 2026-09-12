@@ -321,19 +321,27 @@ def prepare_rnaseq_launch_info(dataset: Dataset) -> LaunchInfo:
 #   tier2 -- per-sample results/stats/logs, for re-analysis/auditing
 #   tier3 -- BAMs: largest, re-derivable from FASTQs, least urgent
 #
-# filename_string matches the FULL S3 key, not just the basename -- anchor
-# with "$" (safe, basename is always at the end) not "^"; test any new/edited
-# pattern against real S3 keys before relying on it (a "^"-anchored
-# merged_matrices pattern silently matched nothing until this was caught).
+# filename_string matches the FULL S3 key (not just the basename -- anchor
+# with "$", not "^") and is piped into plain `grep`, i.e. BRE not
+# extended/PCRE: alternation is "\|" not "|", grouping "\(...\)" not "(...)",
+# quantifiers "\?"/"\+" not "?"/"+", and no lookahead/lookbehind -- "(?!...)"
+# is invalid and silently matches nothing (confirmed working example:
+# "rsem\.merged\|multiqc/"). Test any new/edited pattern against real S3
+# keys with plain `grep` before relying on it.
+#
+# samtools_stats/'s 6 files/sample split into raw (<sample>.sorted.bam.*)
+# vs markdup (<sample>.markdup.sorted.bam.*); since sample IDs never contain
+# a ".", raw is matched positively by "no dot right before sorted.bam."
+# rather than the BRE-illegal "not markdup" negation.
 SYNINDEX_TIERS = [
-    ("tier1", "matrices_and_multiqc", "", r"/rsem\.merged\.|/multiqc/"),
+    ("tier1", "matrices_and_multiqc", "", r"/rsem\.merged\.\|/multiqc/"),
     ("tier1", "fastqc", "fastqc", None),
-    ("tier1", "trimgalore_and_pipeline_info", "", r"/trimgalore/|/pipeline_info/"),
-    ("tier2", "rsem_results", "star_rsem", r"\.genes\.results$|\.isoforms\.results$"),
-    ("tier2", "samtools_stats_raw", "star_rsem/samtools_stats", r"^(?!.*\.markdup\.).*\.stats$"),
-    ("tier2", "samtools_stats_markdup", "star_rsem/samtools_stats", r"\.markdup\.stats$"),
+    ("tier1", "trimgalore_and_pipeline_info", "", r"/trimgalore/\|/pipeline_info/"),
+    ("tier2", "rsem_results", "star_rsem", r"\.genes\.results$\|\.isoforms\.results$"),
+    ("tier2", "samtools_stats_raw", "star_rsem/samtools_stats", r"/[^/.]*\.sorted\.bam\."),
+    ("tier2", "samtools_stats_markdup", "star_rsem/samtools_stats", r"\.markdup\.sorted\.bam\."),
     ("tier2", "star_logs", "star_rsem", r"\.stat/"),
-    ("tier3", "bams", "star_rsem", r"\.markdup\.sorted\.bam(\.bai)?$"),
+    ("tier3", "bams", "star_rsem", r"\.markdup\.sorted\.bam\.bai$\|\.markdup\.sorted\.bam$"),
 ]
 
 
