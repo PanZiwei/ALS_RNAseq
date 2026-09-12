@@ -1,0 +1,15 @@
+# Infra config for orca_rnaseq_workflow.py, kept out of code so it can be
+# reviewed/changed without touching Python. Science params (aligner, skip
+# flags, reference genome) stay in als_rnaseq_params.json -- this file is
+# S3/AWS/staging plumbing only.
+#
+# The completed ALS combined run (1,794 samples) used this complementaire bucket
+# Future runs are moving to the sagebrain-project Tower workspace/bucket
+# (sagebrain-project-tower-bucket, "sagebrain" AWS profile); 
+aws_profile: tower
+bucket_name: complementaire-project-tower-bucket
+
+# Per-dataset S3 key prefix where this workflow stages files, keyed by the
+# same `name` used in config/als_dataset_syn_ids.yml's datasets list.
+staging_keys:
+  als: ALS/

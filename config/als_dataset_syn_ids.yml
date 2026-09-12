@@ -1,0 +1,13 @@
+# Synapse IDs for the ALS RNA-seq dataset, kept out of orca_rnaseq_workflow.py
+# so the provenance record (which Synapse entity backs each pipeline input/output) 
+# is a reviewable config diff, not a code change.
+#
+# Adding a cohort/disease later: append another entry under `datasets`, no
+# code changes needed -- generate_datasets() in orca_rnaseq_workflow.py reads
+# this list directly.
+
+datasets:
+  - name: als
+    samplesheet_id: syn76551366        # ALS/input/als_samplesheet.csv
+    samplesheet_filename: als_samplesheet.csv
+    output_folder_id: syn77232836      # ALS/rnaseq_output/

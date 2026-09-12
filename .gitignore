@@ -1,0 +1,6 @@
+.DS_Store
+~$*
+
+# Controlled-access files stays on EC2 for the RNA-seq pipeline, uploaded to
+# Synapse rather than committed -- never meant to live in git.
+data/
