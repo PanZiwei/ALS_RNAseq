@@ -1,16 +1,18 @@
 """ORCA recipe: nf-core/rnaseq bulk RNA-seq processing on GRCh38.
 Implements SKG-145 (https://sagebionetworks.jira.com/browse/SKG-145).
 
-Orchestrate four steps (run in order):
-  1. fetch_samplesheet  : Synapse -> S3
-  2. synstage           : nf-synapse, download FASTQs Synapse -> S3
-  3. rnaseq             : nf-core/rnaseq alignment/quantification
-  4. synindex           : nf-synapse, S3 -> Synapse, one Tower run per
-                          SYNINDEX_TIERS entry (8 total):
-                            tier1 (3 entries) -- merged matrices + QC + provenance
-                            tier2 (4 entries) -- per-sample results/stats/logs
-                            tier3 (1 entry)   -- BAMs
-                          No resume: one entry failing stops the whole run, re-run redoes every entry 
+Orchestrate five steps (run in order):
+  1. fetch_samplesheet     : Synapse -> S3
+  2. synstage              : nf-synapse, download FASTQs Synapse -> S3
+  3. rnaseq                : nf-core/rnaseq alignment/quantification
+  4. split_samtools_stats  : split star_rsem/samtools_stats/ (the one folder over
+                             Synapse's 10k-children limit) into raw/ + markdup/
+  5. synindex              : nf-synapse, S3 -> Synapse, a SINGLE run over the whole
+                             output_directory (mirrors the tree into parent_id).
+                             Works because split_samtools_stats already fixed the
+                             only folder over Synapse's 10k-children limit; there is
+                             no per-run object limit. Resumable: skipped if a prior
+                             synindex run for this dataset already succeeded.
 
 Prerequisites:
   - pip install py-orca pyyaml
@@ -22,11 +24,11 @@ Prerequisites:
     2. export NEXTFLOWTOWER_CONNECTION_URI="https://:<token>@tower.sagebionetworks.org/api?workspace=Sage-Bionetworks%2Fcomplementaire-project"
 
 Usage:
-  python orca_rnaseq_workflow.py                        # all four steps
+  python orca_rnaseq_workflow.py                        # all steps
   python orca_rnaseq_workflow.py synstage                # one step
   python orca_rnaseq_workflow.py synstage rnaseq         # multiple steps
-  python orca_rnaseq_workflow.py synindex --tier tier3   # synindex, one tier only
-  python orca_rnaseq_workflow.py synindex --tier tier1 --tier tier3  # 2 tiers
+  python orca_rnaseq_workflow.py split_samtools_stats    # pre-index folder split only
+  python orca_rnaseq_workflow.py synindex                # index everything (single run)
 """
 import asyncio
 import argparse
@@ -42,6 +44,8 @@ from orca.services.nextflowtower.models import LaunchInfo
 from synapseclient import Synapse
 from synapseclient.operations import get as syn_get
 from synapseclient.operations.factory_operations import FileOptions
+
+from split_samtools_stats import split_samtools_stats
 
 PARAMS_PATH = Path(__file__).parent / "als_rnaseq_params.json"
 """Science params only -- input/outdir are computed below, see "_note" key in the JSON."""
@@ -98,21 +102,14 @@ async def main():
     )
     parser.add_argument(
         'step', nargs='*', default='all',
-        choices=['all', 'fetch_samplesheet', 'synstage', 'rnaseq', 'synindex'],
-        help="One or more steps to run, in order (default: all four)",
-    )
-    parser.add_argument(
-        '--tier', action='append',
-        choices=sorted({tier_name for tier_name, *_ in SYNINDEX_TIERS}),
-        help="synindex step ONLY -- ignored for fetch_samplesheet/synstage/"
-             "rnaseq. Restricts synindex to one tier from SYNINDEX_TIERS "
-             "(repeatable, e.g. --tier tier1 --tier tier3). Default: all tiers.",
+        choices=['all', 'fetch_samplesheet', 'synstage', 'rnaseq', 'split_samtools_stats', 'synindex'],
+        help="One or more steps to run, in order (default: all)",
     )
     args = parser.parse_args()
 
     ops = NextflowTowerOps()
     datasets = generate_datasets()
-    runs = [run_workflows(ops, dataset, args.step, args.tier) for dataset in datasets]
+    runs = [run_workflows(ops, dataset, args.step) for dataset in datasets]
     statuses = await asyncio.gather(*runs)
     print(statuses)
 
@@ -303,94 +300,40 @@ def prepare_rnaseq_launch_info(dataset: Dataset) -> LaunchInfo:
         nextflow_config=CONFIG_PATH.read_text(),
     )
 
-# synindex (nf-synapse) can't reliably process more than ~10,000 S3 objects
-# in one run -- indexing the whole output_directory in one call failed
-# Fix: one synindex run per (tier, label, s3_subprefix, filename_string) entry below, 
-# each under the S3 object limit.
-# s3_subprefix="" means "the whole output_directory" -- used to merge
-# several small sibling S3 folders (e.g. multiqc/, pipeline_info/) into one
-# run via filename_string, when their combined size is still safely under
-# the limit. 
-# Everything under star_rsem/ shares s3_subprefix="star_rsem" (flat on S3) and uses filename_string to
-# non-overlappingly partition it instead.
+# synindex is a SINGLE run over the whole output_directory -- no tiering, no
+# filename_string. The only hard Synapse limit is 10,000 CHILDREN PER FOLDER,
+# confirmed by the real error on a samtools_stats file:
+#   400 Client Error: Limit of 10000 children exceeded for parent: syn76651134
+# There is NO per-run object-count limit. The split_samtools_stats pre-step brings
+# the one offending folder (samtools_stats/, 10,764) under 10k; every other folder
+# is already < 10k (next largest star_rsem/ ~7,180). So once the split has run, one
+# synindex call mirrors the entire tree into parent_id.
 #
-# Tiers run in order, most useful first, so a paused/partial synindex run
-# still leaves the most valuable artifacts on Synapse; --tier restricts a run
-# to one or more tiers (e.g. --tier tier3 to re-run just the BAMs):
-#   tier1 -- merged matrices + QC + provenance
-#   tier2 -- per-sample results/stats/logs, for re-analysis/auditing
-#   tier3 -- BAMs: largest, re-derivable from FASTQs, least urgent
-#
-# filename_string matches the FULL S3 key (not just the basename -- anchor
-# with "$", not "^") and is piped into plain `grep`, i.e. BRE not
-# extended/PCRE: alternation is "\|" not "|", grouping "\(...\)" not "(...)",
-# quantifiers "\?"/"\+" not "?"/"+", and no lookahead/lookbehind -- "(?!...)"
-# is invalid and silently matches nothing (confirmed working example:
-# "rsem\.merged\|multiqc/"). Test any new/edited pattern against real S3
-# keys with plain `grep` before relying on it.
-#
-# samtools_stats/'s 6 files/sample split into raw (<sample>.sorted.bam.*)
-# vs markdup (<sample>.markdup.sorted.bam.*); since sample IDs never contain
-# a ".", raw is matched positively by "no dot right before sorted.bam."
-# rather than the BRE-illegal "not markdup" negation.
-SYNINDEX_TIERS = [
-    ("tier1", "matrices_and_multiqc", "", r"/rsem\.merged\.\|/multiqc/"),
-    ("tier1", "fastqc", "fastqc", None),
-    ("tier1", "trimgalore_and_pipeline_info", "", r"/trimgalore/\|/pipeline_info/"),
-    ("tier2", "rsem_results", "star_rsem", r"\.genes\.results$\|\.isoforms\.results$"),
-    ("tier2", "samtools_stats_raw", "star_rsem/samtools_stats", r"/[^/.]*\.sorted\.bam\."),
-    ("tier2", "samtools_stats_markdup", "star_rsem/samtools_stats", r"\.markdup\.sorted\.bam\."),
-    ("tier2", "star_logs", "star_rsem", r"\.stat/"),
-    ("tier3", "bams", "star_rsem", r"\.markdup\.sorted\.bam\.bai$\|\.markdup\.sorted\.bam$"),
-]
+# Re-run note: if this fails partway, re-running re-indexes everything. Synapse
+# matches File by name+parent, so entities are UPDATED, not duplicated (a fresh
+# run does bump a new version per file). Acceptable for a whole-run restart.
+def prepare_synindex_launch_info(dataset: Dataset) -> LaunchInfo:
+    """Generate LaunchInfo for the single nf-synindex run over the whole output.
 
-
-def prepare_synindex_launch_info(
-    dataset: Dataset, s3_subprefix: str, filename_string: str | None, tier_name: str, run_label: str,
-) -> LaunchInfo:
-    """Generate LaunchInfo for one nf-synindex run, scoped to one entry from SYNINDEX_TIERS.
-
-    Arguments:
-        dataset: The dataset whose output is being indexed
-        s3_subprefix: Relative S3 prefix under output_directory
-        filename_string: nf-synapse filename filter regex, or None to index
-            everything under s3_subprefix
-        tier_name: This entry's tier from SYNINDEX_TIERS, e.g. "tier1, tier2, tier3"
-        run_label: This entry's label from SYNINDEX_TIERS, e.g.
-            "merged_matrices" -- together they form this run's Tower
-            run_name, e.g. "synindex_syn76551366_tier1_matrices_and_multiqc"
-
-    Returns:
-        The Nextflow Tower workflow launch specification for this synindex run
+    No filename_string -> nf-synapse indexes every object under s3_prefix,
+    mirroring the S3 folder structure 1:1 into parent_id.
     """
-    # s3_subprefix="" means "the whole output_directory" -- used when
-    # filename_string alone picks out objects from multiple sibling S3
-    # folders in one run (see the merged tier1 entries in SYNINDEX_TIERS).
-    s3_prefix = dataset.output_directory if not s3_subprefix else f"{dataset.output_directory}{s3_subprefix}/"
-    params = {
-        "s3_prefix": s3_prefix,
-        "parent_id": dataset.synapse_id_for_output,
-        "entry": "synindex",
-    }
-    if filename_string is not None:
-        params["filename_string"] = filename_string
     return LaunchInfo(
-        run_name=f"{dataset.synindex_run_name}_{tier_name}_{run_label}",
+        run_name=dataset.synindex_run_name,
         pipeline="Sage-Bionetworks-Workflows/nf-synapse",
         revision="main",
         profiles=["sage"],
-        params=params,
-        workspace_secrets=["SYNAPSE_AUTH_TOKEN"]  # set as workspace secret (not user secret) in Tower
+        params={
+            "s3_prefix": dataset.output_directory,
+            "parent_id": dataset.synapse_id_for_output,
+            "entry": "synindex",
+        },
+        workspace_secrets=["SYNAPSE_AUTH_TOKEN"],  # set as workspace secret (not user secret) in Tower
     )
 
 
-async def run_workflows(ops: NextflowTowerOps, dataset: Dataset, step, tiers: list[str] | None = None):
-    """Run the requested step(s) for one dataset.
-
-    Arguments:
-        tiers: If given, restricts the synindex step to these SYNINDEX_TIERS
-            tier names (e.g. ["core"]); None runs every tier.
-    """
+async def run_workflows(ops: NextflowTowerOps, dataset: Dataset, step):
+    """Run the requested step(s) for one dataset, in order."""
     if 'all' in step or 'fetch_samplesheet' in step:
         print('fetching samplesheet')
         syn = Synapse()
@@ -410,19 +353,26 @@ async def run_workflows(ops: NextflowTowerOps, dataset: Dataset, step, tiers: li
         rnaseq_run_id = ops.launch_workflow(rnaseq_info, "ondemand", ignore_previous_runs=True)
         print(await monitor_workflow(ops, rnaseq_run_id))
 
+    if 'all' in step or 'split_samtools_stats' in step:
+        # Pre-synindex: split star_rsem/samtools_stats/ (10,764 files, the only
+        # folder over Synapse's 10k-children limit) into raw/ + markdup/. Idempotent
+        # and blocking boto3, so run it off the event loop. See split_samtools_stats.py.
+        print('splitting star_rsem/samtools_stats/ into raw/ + markdup/ (10k-per-folder limit)')
+        await asyncio.to_thread(
+            split_samtools_stats, f"{dataset.output_directory}star_rsem/samtools_stats/"
+        )
+
     if 'all' in step or 'synindex' in step:
-        # One synindex run per SYNINDEX_TIERS entry (see its comment); tiers
-        # restricts this to a subset when set (--tier on the CLI).
-        entries = SYNINDEX_TIERS if tiers is None else [
-            entry for entry in SYNINDEX_TIERS if entry[0] in tiers
-        ]
-        for tier_name, run_label, s3_subprefix, filename_string in entries:
-            print(f'starting synindex ({tier_name}/{run_label})')
-            synindex_info = prepare_synindex_launch_info(
-                dataset, s3_subprefix, filename_string, tier_name, run_label
-            )
-            synindex_run_id = ops.launch_workflow(synindex_info, "spot", ignore_previous_runs=True)
-            print(await monitor_workflow(ops, synindex_run_id))
+        # Single run over the whole output_directory (see prepare_synindex_launch_info).
+        # No skip-if-succeeded pre-check: it calls ops.list_workflows(), which orca
+        # crashes on against the current Tower API (the /workflow response ends with a
+        # trailing `truncated` bool that orca's popitem() mistakes for the items list).
+        # Re-running synindex is safe anyway -- Synapse matches by name+parent, so it
+        # updates entities (bumps version) rather than duplicating.
+        print('starting synindex')
+        synindex_info = prepare_synindex_launch_info(dataset)
+        synindex_run_id = ops.launch_workflow(synindex_info, "spot", ignore_previous_runs=True)
+        print(await monitor_workflow(ops, synindex_run_id))
 
 
 def _self_check():
@@ -444,7 +394,6 @@ def _self_check():
         rnaseq_info = prepare_rnaseq_launch_info(ds)
         assert rnaseq_info.params["input"] == ds.staged_samplesheet_location
         assert rnaseq_info.params["outdir"] == ds.output_directory
-
     print("self-check OK")
 
 
