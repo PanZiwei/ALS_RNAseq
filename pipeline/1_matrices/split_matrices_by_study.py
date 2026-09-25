@@ -4,6 +4,10 @@ The split streams the TSV line by line and writes all 7 study files in a
 single pass. rsem.merged.transcript_*.tsv is ~2.2 GiB; loading that into
 pandas would need well over 10 GiB of RAM, more than this host has.
 
+Runs on EC2 (downloads controlled-access data). Set a Synapse token first --
+a personal access token with Download scope (add Modify for `upload`):
+  export SYNAPSE_AUTH_TOKEN='<token>'
+
 Usage:
   python split_matrices_by_study.py --check    # verify sample->study mapping, no matrices needed
   python split_matrices_by_study.py --test     # split 1 matrix, verify 2 real samples match source

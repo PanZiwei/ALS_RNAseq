@@ -121,6 +121,15 @@ matrices into one file per study (`split`) and uploads them to Synapse
 assert columns match source) verify without a full run. Runs on **EC2** because
 it downloads controlled-access data.
 
+Set a Synapse token for EC2 istance (a personal access token with Download scope):
+```bash
+export SYNAPSE_AUTH_TOKEN='<token>' #Synapse personal access token for EC2 instance
+python pipeline/1_matrices/split_matrices_by_study.py --check   # confirm auth + mapping
+python pipeline/1_matrices/split_matrices_by_study.py split --data-dir /path/to/merged_matrices
+```
+The 4 `rsem.merged.*.tsv` files must already be in `--data-dir`; the script only
+fetches the small mapping CSVs from Synapse itself.
+
 ## Data sources
 
 - **Input FASTQs & samplesheet** — [Synapse](https://www.synapse.org/); IDs in
