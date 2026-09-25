@@ -17,6 +17,7 @@ datasets:
 # cached under data/. study_keywords maps each study's dataset_synid (must match
 # the dataset_synid column in dataset_targets.csv) to a short filename slug.
 split_matrices_inputs:
+  rsem_matrices_folder_id: syn77361181            # folder holding the 4 rsem.merged.*.tsv (fetch source)
   dataset_targets_id: syn77364344                 # dataset_targets.csv
   samplesheet_with_dataset_names_id: syn77364335  # samplesheet_with_dataset_names.csv
   study_keywords:

@@ -1,30 +1,33 @@
 """Split the combined run's merged RSEM matrices into one file per study.
 
-The split streams the TSV line by line and writes all 7 study files in a
-single pass. rsem.merged.transcript_*.tsv is ~2.2 GiB; loading that into
-pandas would need well over 10 GiB of RAM, more than this host has.
+The split streams each TSV line by line and writes all study files in one pass,
+so the ~2.2 GiB matrices are never loaded into RAM.
 
-Runs on EC2 (downloads controlled-access data). Set a Synapse token first --
-a personal access token with Download scope (add Modify for `upload`):
+Runs on EC2 (controlled-access data). Set a Synapse token first -- a personal
+access token with Download scope (add Modify for `upload`):
   export SYNAPSE_AUTH_TOKEN='<token>'
 
+Steps (run one, several in order, or default `split`):
+  fetch   download all inputs into --data-dir: the 4 merged matrices + the two
+          sample->study mapping files (dataset_targets, samplesheet_with_dataset_names)
+  split   split each matrix in --data-dir into one file per study, into --out-dir
+  upload  upload the per-study files to Synapse (--upload-parent synXXXXXXX)
+
 Usage:
-  python split_matrices_by_study.py --check    # verify sample->study mapping, no matrices needed
-  python split_matrices_by_study.py --test     # split 1 matrix, verify 2 real samples match source
-  python split_matrices_by_study.py split      # split all 4 matrices x 7 studies (needs --data-dir)
-  python split_matrices_by_study.py upload --upload-parent synXXXXXXX   # upload per-study files
+  python split_matrices_by_study.py --check    # verify mapping only
+  python split_matrices_by_study.py fetch      # download the 4 matrices
+  python split_matrices_by_study.py split
+  python split_matrices_by_study.py upload --upload-parent synXXXXXXX
 
-The merged matrices are expected to be already downloaded into --data-dir.
-
-samplesheet_with_dataset_names.csv and dataset_targets.csv are not committed
-to this repo -- Synapse is their source of truth (see
-config/als_dataset_syn_ids.yml's split_matrices_inputs). They're downloaded
-into --data-dir on first use and cached there; delete the cached copy to
-force a re-download if the Synapse files change.
+All source Synapse IDs (matrices folder + the two mapping CSVs) live in
+config/als_dataset_syn_ids.yml's split_matrices_inputs. The mapping CSVs are
+pulled automatically by split/upload/--check; the matrices by `fetch`. All are
+cached in --data-dir.
 """
 import argparse
 import csv
 import sys
+from operator import itemgetter
 from pathlib import Path
 
 import yaml
@@ -36,55 +39,65 @@ SPLIT_INPUTS = CONFIG["split_matrices_inputs"]
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "rsem_merged_tsv"
 DEFAULT_OUT_DIR = REPO_ROOT / "data" / "per_study"
 
-
-def _fetch_from_synapse(synapse_id: str, filename: str, data_dir: Path) -> Path:
-    """Download a file from Synapse into data_dir, caching it there.
-
-    Arguments:
-        synapse_id: The Synapse ID of the file to download
-        filename: Local filename to cache it as, under data_dir
-        data_dir: Directory to cache the downloaded file in
-
-    Returns:
-        Path to the (possibly cached) local file
-    """
-    local_path = data_dir / filename
-    if local_path.exists():
-        return local_path
-
-    import synapseclient
-    from synapseclient.operations import get as syn_get
-
-    data_dir.mkdir(parents=True, exist_ok=True)
-    syn = synapseclient.Synapse()
-    syn.login(silent=True)
-    downloaded = syn_get(synapse_id, synapse_client=syn)
-    local_path.write_bytes(Path(downloaded.path).read_bytes())
-    return local_path
-
 MATRIX_FILES = [
     "rsem.merged.gene_counts.tsv",
     "rsem.merged.gene_tpm.tsv",
     "rsem.merged.transcript_counts.tsv",
     "rsem.merged.transcript_tpm.tsv",
 ]
-
 EXPECTED_SAMPLES = 1794
+STUDY_KEYWORDS = SPLIT_INPUTS["study_keywords"]  # dataset_synid -> filename slug
 
-# Short filename slug per study -- see config/als_dataset_syn_ids.yml's
-# split_matrices_inputs.study_keywords for the values and rationale.
-STUDY_KEYWORDS = SPLIT_INPUTS["study_keywords"]
+
+def _synapse():
+    import synapseclient
+    syn = synapseclient.Synapse()
+    syn.login(silent=True)
+    return syn
+
+
+def _children(syn, parent_id: str) -> list[dict]:
+    """List a folder's children via the non-deprecated (async) get_children API,
+    run synchronously so the rest of the script stays plain."""
+    import asyncio
+    from synapseclient.api import get_children
+
+    async def _collect():
+        return [c async for c in get_children(parent_id, synapse_client=syn)]
+
+    return asyncio.run(_collect())
+
+
+def _fetch(synapse_id: str, filename: str, data_dir: Path) -> Path:
+    """Download a Synapse file into data_dir as `filename`, cached there.
+    Streams to disk (downloadLocation) so multi-GB matrices never load into RAM."""
+    from synapseclient.operations import FileOptions
+    from synapseclient.operations import get as syn_get
+
+    local = data_dir / filename
+    if local.exists():
+        return local
+    data_dir.mkdir(parents=True, exist_ok=True)
+    entity = syn_get(
+        synapse_id,
+        file_options=FileOptions(download_location=str(data_dir)),
+        synapse_client=_synapse(),
+    )
+    got = Path(entity.path)
+    if got != local:
+        got.replace(local)
+    return local
 
 
 def _load_studies(data_dir: Path) -> dict[str, str]:
     """dataset_synid -> dataset_name, validated against STUDY_KEYWORDS."""
-    path = _fetch_from_synapse(SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", data_dir)
+    path = _fetch(SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", data_dir)
     with open(path) as f:
         studies = {r["dataset_synid"]: r["dataset_name"] for r in csv.DictReader(f)}
     if set(studies) != set(STUDY_KEYWORDS):
         raise SystemExit(
             f"dataset_targets.csv study IDs {sorted(studies)} do not match "
-            f"STUDY_KEYWORDS {sorted(STUDY_KEYWORDS)} -- update STUDY_KEYWORDS"
+            f"STUDY_KEYWORDS {sorted(STUDY_KEYWORDS)} -- update config"
         )
     return studies
 
@@ -92,7 +105,7 @@ def _load_studies(data_dir: Path) -> dict[str, str]:
 def build_sample_to_study(data_dir: Path) -> dict[str, str]:
     """Map each sample -> study_id, joining the samplesheet on dataset_name."""
     name_to_synid = {name: sid for sid, name in _load_studies(data_dir).items()}
-    samplesheet = _fetch_from_synapse(
+    samplesheet = _fetch(
         SPLIT_INPUTS["samplesheet_with_dataset_names_id"],
         "samplesheet_with_dataset_names.csv", data_dir,
     )
@@ -104,190 +117,133 @@ def out_name(study_id: str, matrix_name: str) -> str:
     return f"{study_id}_{STUDY_KEYWORDS[study_id]}.{matrix_name}"
 
 
-def split_matrix(local_path: Path, sample_to_study: dict[str, str], out_dir: Path) -> list[Path]:
-    """Stream one merged matrix into one file per study. Returns written paths.
-
-    Single pass: every study's output file is open at once and each input line
-    is fanned out to all of them, so the 2.2 GiB matrices are never held in
-    memory and are read from disk only once.
-    """
+def split_matrix(src: Path, sample_to_study: dict[str, str], out_dir: Path) -> None:
+    """Stream one merged matrix into one file per study (single pass, low memory)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(local_path) as fh:
+    with open(src) as fh:
         header = fh.readline().rstrip("\n").split("\t")
-        id_cols = header[:2]  # gene_id/transcript_id + second RSEM column
-        sample_cols = header[2:]
-
-        unknown = [c for c in sample_cols if c not in sample_to_study]
+        unknown = [c for c in header[2:] if c not in sample_to_study]
         if unknown:
-            raise SystemExit(
-                f"{local_path.name}: {len(unknown)} column(s) not in the samplesheet, "
-                f"e.g. {unknown[:5]}"
-            )
+            raise SystemExit(f"{src.name}: {len(unknown)} column(s) not in samplesheet, e.g. {unknown[:5]}")
 
-        # Column indices per study, so the row loop is a plain list lookup.
-        indices: dict[str, list[int]] = {}
+        # Per study: the id columns (0,1) + that study's sample columns, picked
+        # with itemgetter (C-speed) so the row loop has no per-column Python work.
+        writers = []  # (handle, itemgetter)
         for study_id in STUDY_KEYWORDS:
-            cols = [i for i, c in enumerate(header) if i >= 2 and sample_to_study[c] == study_id]
-            if cols:
-                indices[study_id] = [0, 1] + cols
-
-        handles = {}
-        written = []
+            cols = [0, 1] + [i for i, c in enumerate(header) if i >= 2 and sample_to_study[c] == study_id]
+            if len(cols) == 2:
+                continue
+            fh_out = open(out_dir / out_name(study_id, src.name), "w")
+            pick = itemgetter(*cols)
+            fh_out.write("\t".join(pick(header)) + "\n")
+            writers.append((fh_out, pick))
         try:
-            for study_id, idx in indices.items():
-                path = out_dir / out_name(study_id, local_path.name)
-                handles[study_id] = open(path, "w")
-                handles[study_id].write("\t".join(header[i] for i in idx) + "\n")
-                written.append(path)
-
             for line in fh:
                 parts = line.rstrip("\n").split("\t")
-                for study_id, idx in indices.items():
-                    handles[study_id].write("\t".join(parts[i] for i in idx) + "\n")
+                for fh_out, pick in writers:
+                    fh_out.write("\t".join(pick(parts)) + "\n")
         finally:
-            for h in handles.values():
-                h.close()
-
-    for study_id, idx in indices.items():
-        print(f"  {out_name(study_id, local_path.name)}: {len(idx) - len(id_cols)} samples")
-    return written
+            for fh_out, _ in writers:
+                fh_out.close()
+    print(f"  {src.name}: {len(writers)} study files")
 
 
 # -- steps --------------------------------------------------------------------
 
+def cmd_fetch(args) -> None:
+    """Download all inputs into --data-dir: the 4 merged matrices (matched by name
+    from the source folder, which holds other files too) plus the two sample->study
+    mapping files (dataset_targets.csv, samplesheet_with_dataset_names.csv). Folder
+    ID defaults to split_matrices_inputs.rsem_matrices_folder_id; --synid overrides."""
+    synid = args.synid or SPLIT_INPUTS.get("rsem_matrices_folder_id")
+    if not synid:
+        raise SystemExit("no folder ID -- set rsem_matrices_folder_id in config or pass --synid")
+    ids = {c["name"]: c["id"] for c in _children(_synapse(), synid)}
+    for name in MATRIX_FILES:
+        if name not in ids:
+            raise SystemExit(f"{name} not found in {synid}")
+        print(f"fetching {name} ({ids[name]}) ...")
+        _fetch(ids[name], name, args.data_dir)
+    # also grab the sample->study mapping files, so all inputs are local after `fetch`
+    _fetch(SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", args.data_dir)
+    _fetch(SPLIT_INPUTS["samplesheet_with_dataset_names_id"],
+           "samplesheet_with_dataset_names.csv", args.data_dir)
+    print("fetched 4 merged matrices + mapping files "
+          "(dataset_targets.csv, samplesheet_with_dataset_names.csv)")
+
+
 def cmd_split(args) -> None:
     sample_to_study = build_sample_to_study(args.data_dir)
     for filename in MATRIX_FILES:
-        local_path = args.data_dir / filename
-        if not local_path.exists():
-            raise SystemExit(f"{local_path} not found -- put the merged matrices in --data-dir")
-        print(f"{filename}:")
-        split_matrix(local_path, sample_to_study, args.out_dir)
+        src = args.data_dir / filename
+        if not src.exists():
+            raise SystemExit(f"{src} not found -- run `fetch --synid ...` first")
+        split_matrix(src, sample_to_study, args.out_dir)
 
 
 def cmd_upload(args) -> None:
-    """Upload the per-study matrices to Synapse, one folder per study."""
+    """Upload per-study matrices to Synapse: one folder per study, each file
+    annotated with its dataset. Re-runs are safe -- store() matches by
+    name+parent, so it updates entities (new version) rather than duplicating."""
     if not args.upload_parent:
         raise SystemExit("upload requires --upload-parent synXXXXXXX")
-
-    import synapseclient
     from synapseclient import File, Folder
-
-    studies = _load_studies(args.data_dir)
-    syn = synapseclient.Synapse()
-    syn.login(silent=True)
-
-    for study_id, dataset_name in studies.items():
+    syn = _synapse()
+    for study_id, dataset_name in _load_studies(args.data_dir).items():
         paths = [args.out_dir / out_name(study_id, m) for m in MATRIX_FILES]
         missing = [p for p in paths if not p.exists()]
         if missing:
-            raise SystemExit(f"{[str(p) for p in missing]} not found -- run the `split` step first")
-
+            raise SystemExit(f"{[str(p) for p in missing]} not found -- run `split` first")
         folder_name = f"{study_id}_{STUDY_KEYWORDS[study_id]}"
         print(f"{folder_name} ({dataset_name[:60]}...)")
         if args.dry_run:
-            for path in paths:
-                print(f"  would upload {path.name} -> {args.upload_parent}/{folder_name}")
+            for p in paths:
+                print(f"  would upload {p.name} -> {args.upload_parent}/{folder_name}")
             continue
-
         folder = syn.store(Folder(folder_name, parent=args.upload_parent))
-        for path in paths:
-            entity = syn.store(
-                File(
-                    str(path),
-                    parent=folder,
-                    annotations={"dataset_synid": study_id, "dataset_name": dataset_name},
-                )
-            )
-            print(f"  uploaded {path.name} -> {entity.id}")
+        for p in paths:
+            e = syn.store(File(str(p), parent=folder,
+                               annotations={"dataset_synid": study_id, "dataset_name": dataset_name}))
+            print(f"  uploaded {p.name} -> {e.id}")
 
-
-# -- checks -------------------------------------------------------------------
 
 def _self_check(data_dir: Path) -> None:
+    """Verify the sample->study mapping resolves to the expected study set/count."""
     studies = _load_studies(data_dir)
     sample_to_study = build_sample_to_study(data_dir)
-    assert len(sample_to_study) == EXPECTED_SAMPLES, (
-        f"expected {EXPECTED_SAMPLES} samples, got {len(sample_to_study)}"
-    )
     counts: dict[str, int] = {}
-    for study_id in sample_to_study.values():
-        counts[study_id] = counts.get(study_id, 0) + 1
-    assert sum(counts.values()) == EXPECTED_SAMPLES
-    assert set(counts) == set(STUDY_KEYWORDS), (
-        f"study_id mismatch: {set(counts)} vs {set(STUDY_KEYWORDS)}"
-    )
-    for study_id, count in sorted(counts.items(), key=lambda kv: -kv[1]):
-        print(f"{study_id} ({STUDY_KEYWORDS[study_id]}): {count} samples -- {studies[study_id][:60]}")
+    for sid in sample_to_study.values():
+        counts[sid] = counts.get(sid, 0) + 1
+    assert len(sample_to_study) == EXPECTED_SAMPLES, f"expected {EXPECTED_SAMPLES}, got {len(sample_to_study)}"
+    assert set(counts) == set(STUDY_KEYWORDS), f"study mismatch: {set(counts)} vs {set(STUDY_KEYWORDS)}"
+    for sid, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"{sid} ({STUDY_KEYWORDS[sid]}): {n} samples -- {studies[sid][:60]}")
     print("self-check OK")
-
-
-def _column(path: Path, sample: str) -> list[str]:
-    """The [gene_id, value] pairs for one sample column, in file order."""
-    with open(path) as f:
-        rows = csv.reader(f, delimiter="\t")
-        header = next(rows)
-        j = header.index(sample)
-        return [(r[0], r[j]) for r in rows]
-
-
-def _end_to_end_test(args) -> None:
-    """Real-data correctness: split 1 matrix, then verify a per-study output
-    column is byte-identical to the source for 2 real samples -- catches
-    misrouted/shifted columns, not just shape. Plain csv, no pandas."""
-    from collections import Counter
-
-    sample_to_study = build_sample_to_study(args.data_dir)
-    src = args.data_dir / "rsem.merged.gene_counts.tsv"  # smallest of the 4
-    if not src.exists():
-        raise SystemExit(f"{src} not found -- put the merged matrices in --data-dir")
-
-    study_id = Counter(sample_to_study.values()).most_common(1)[0][0]
-    out_dir = Path("/tmp/merged_matrices_test")
-    split_matrix(src, sample_to_study, out_dir)
-    out_path = out_dir / out_name(study_id, src.name)
-
-    test_samples = [s for s, st in sample_to_study.items() if st == study_id][:2]
-    for sample in test_samples:
-        assert _column(src, sample) == _column(out_path, sample), f"{sample}: mismatch"
-        print(f"  {sample}: values match exactly")
-    print("end-to-end test OK -- split output matches source for tested samples")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    # No `choices` here: argparse validates a nargs="*" empty default against
-    # `choices` and wrongly rejects it (bpo-9625). Validated in code below.
-    parser.add_argument("step", nargs="*",
-                        help="Steps to run, in order: split, upload (default: split)")
+    parser.add_argument("step", nargs="*", help="fetch, split, upload (default: split)")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
-                        help=f"Where the merged matrices live (default: {DEFAULT_DATA_DIR})")
+                        help=f"merged matrices + cached CSVs (default: {DEFAULT_DATA_DIR})")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
-                        help=f"Where per-study matrices are written (default: {DEFAULT_OUT_DIR})")
-    parser.add_argument("--upload-parent",
-                        help="Synapse ID of the folder to create per-study folders under")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="For upload: print what would be uploaded, store nothing")
-    parser.add_argument("--check", action="store_true",
-                        help="Verify the sample->study mapping and exit")
-    parser.add_argument("--test", action="store_true",
-                        help="Run the end-to-end correctness test and exit")
+                        help=f"per-study output (default: {DEFAULT_OUT_DIR})")
+    parser.add_argument("--synid", help="fetch: override the config's rsem_matrices_folder_id")
+    parser.add_argument("--upload-parent", help="upload: Synapse folder to create per-study folders under")
+    parser.add_argument("--dry-run", action="store_true", help="upload: print, store nothing")
+    parser.add_argument("--check", action="store_true", help="verify the sample->study mapping and exit")
     args = parser.parse_args()
 
     if args.check:
         _self_check(args.data_dir)
         return
-    if args.test:
-        _end_to_end_test(args)
-        return
 
-    steps = {"split": cmd_split, "upload": cmd_upload}
+    steps = {"fetch": cmd_fetch, "split": cmd_split, "upload": cmd_upload}
     for name in args.step or ["split"]:
         if name not in steps:
-            raise SystemExit(f"unknown step {name!r} (choose from: split, upload)")
+            raise SystemExit(f"unknown step {name!r} (choose from: fetch, split, upload)")
         print(f"== {name} ==")
         steps[name](args)
 

@@ -115,20 +115,20 @@ python pipeline/0_alignment/orca_rnaseq_alignment.py synindex    # run one step
 
 ### Stage 1 — per-study matrices (EC2)
 
-**`pipeline/1_matrices/split_matrices_by_study.py`** — splits the merged RSEM
-matrices into one file per study (`split`) and uploads them to Synapse
-(`upload`). `--check` (sample→study mapping) and `--test` (split one matrix,
-assert columns match source) verify without a full run. Runs on **EC2** because
-it downloads controlled-access data.
+**`pipeline/1_matrices/split_matrices_by_study.py`** — three steps: `fetch` (pull
+the 4 merged RSEM matrices + the two sample→study mapping files from Synapse),
+`split` (one file per study), `upload` (push per-study files back to Synapse).
+Runs on **EC2** because it downloads controlled-access data. All source Synapse
+IDs are in `config/als_dataset_syn_ids.yml`'s `split_matrices_inputs`.
 
-Set a Synapse token for EC2 istance (a personal access token with Download scope):
+Set a Synapse token (personal access token; Download scope, add Modify for upload):
 ```bash
-export SYNAPSE_AUTH_TOKEN='<token>' #Synapse personal access token for EC2 instance
-python pipeline/1_matrices/split_matrices_by_study.py --check   # confirm auth + mapping
-python pipeline/1_matrices/split_matrices_by_study.py split --data-dir /path/to/merged_matrices
+export SYNAPSE_AUTH_TOKEN='<token>'
+python pipeline/1_matrices/split_matrices_by_study.py --check   # verify auth + mapping
+python pipeline/1_matrices/split_matrices_by_study.py fetch     # download all inputs
+python pipeline/1_matrices/split_matrices_by_study.py split
+python pipeline/1_matrices/split_matrices_by_study.py upload --upload-parent synXXXXXXX
 ```
-The 4 `rsem.merged.*.tsv` files must already be in `--data-dir`; the script only
-fetches the small mapping CSVs from Synapse itself.
 
 ## Data sources
 
