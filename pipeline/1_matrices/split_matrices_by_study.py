@@ -5,13 +5,10 @@ single pass. rsem.merged.transcript_*.tsv is ~2.2 GiB; loading that into
 pandas would need well over 10 GiB of RAM, more than this host has.
 
 Usage:
-  python split_merged_matrics_by_study.py --check      # verify sample->study mapping, no I/O
-  python split_merged_matrics_by_study.py --test       # split 1 matrix, verify 2 real samples
-                                                       # match the source values exactly
-  python split_merged_matrics_by_study.py split        # split all 4 matrices x 7 studies
-  python split_merged_matrics_by_study.py upload --upload-parent synXXXXXXX
-                                                       # upload per-study files to Synapse
-  python split_merged_matrics_by_study.py split upload --upload-parent synXXXXXXX
+  python split_matrices_by_study.py --check    # verify sample->study mapping, no matrices needed
+  python split_matrices_by_study.py --test     # split 1 matrix, verify 2 real samples match source
+  python split_matrices_by_study.py split      # split all 4 matrices x 7 studies (needs --data-dir)
+  python split_matrices_by_study.py upload --upload-parent synXXXXXXX   # upload per-study files
 
 The merged matrices are expected to be already downloaded into --data-dir.
 
@@ -77,13 +74,9 @@ STUDY_KEYWORDS = SPLIT_INPUTS["study_keywords"]
 
 def _load_studies(data_dir: Path) -> dict[str, str]:
     """dataset_synid -> dataset_name, validated against STUDY_KEYWORDS."""
-    dataset_targets = _fetch_from_synapse(
-        SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", data_dir
-    )
-    studies = {}
-    with open(dataset_targets) as f:
-        for row in csv.DictReader(f):
-            studies[row["dataset_synid"]] = row["dataset_name"]
+    path = _fetch_from_synapse(SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", data_dir)
+    with open(path) as f:
+        studies = {r["dataset_synid"]: r["dataset_name"] for r in csv.DictReader(f)}
     if set(studies) != set(STUDY_KEYWORDS):
         raise SystemExit(
             f"dataset_targets.csv study IDs {sorted(studies)} do not match "
@@ -93,26 +86,14 @@ def _load_studies(data_dir: Path) -> dict[str, str]:
 
 
 def build_sample_to_study(data_dir: Path) -> dict[str, str]:
-    """Map each sample to its study_id, via dataset_name as the join key."""
-    dataset_targets = _fetch_from_synapse(
-        SPLIT_INPUTS["dataset_targets_id"], "dataset_targets.csv", data_dir
-    )
-    samplesheet_with_dataset = _fetch_from_synapse(
+    """Map each sample -> study_id, joining the samplesheet on dataset_name."""
+    name_to_synid = {name: sid for sid, name in _load_studies(data_dir).items()}
+    samplesheet = _fetch_from_synapse(
         SPLIT_INPUTS["samplesheet_with_dataset_names_id"],
         "samplesheet_with_dataset_names.csv", data_dir,
     )
-
-    name_to_synid = {}
-    with open(dataset_targets) as f:
-        for row in csv.DictReader(f):
-            name_to_synid[row["dataset_name"]] = row["dataset_synid"]
-
-    sample_to_study = {}
-    with open(samplesheet_with_dataset) as f:
-        for row in csv.DictReader(f):
-            study_id = name_to_synid[row["dataset"]]
-            sample_to_study[row["sample"]] = study_id
-    return sample_to_study
+    with open(samplesheet) as f:
+        return {r["sample"]: name_to_synid[r["dataset"]] for r in csv.DictReader(f)}
 
 
 def out_name(study_id: str, matrix_name: str) -> str:
@@ -238,41 +219,35 @@ def _self_check(data_dir: Path) -> None:
     print("self-check OK")
 
 
+def _column(path: Path, sample: str) -> list[str]:
+    """The [gene_id, value] pairs for one sample column, in file order."""
+    with open(path) as f:
+        rows = csv.reader(f, delimiter="\t")
+        header = next(rows)
+        j = header.index(sample)
+        return [(r[0], r[j]) for r in rows]
+
+
 def _end_to_end_test(args) -> None:
-    """Real-data correctness test: split 1 matrix, then verify the per-study
-    output is identical to the source for 2 real sample columns -- not just
-    structurally shaped right, but actually correct values."""
+    """Real-data correctness: split 1 matrix, then verify a per-study output
+    column is byte-identical to the source for 2 real samples -- catches
+    misrouted/shifted columns, not just shape. Plain csv, no pandas."""
     from collections import Counter
-    import pandas as pd
 
     sample_to_study = build_sample_to_study(args.data_dir)
+    src = args.data_dir / "rsem.merged.gene_counts.tsv"  # smallest of the 4
+    if not src.exists():
+        raise SystemExit(f"{src} not found -- put the merged matrices in --data-dir")
+
+    study_id = Counter(sample_to_study.values()).most_common(1)[0][0]
     out_dir = Path("/tmp/merged_matrices_test")
+    split_matrix(src, sample_to_study, out_dir)
+    out_path = out_dir / out_name(study_id, src.name)
 
-    filename = "rsem.merged.gene_counts.tsv"  # smallest of the 4
-    local_path = args.data_dir / filename
-    if not local_path.exists():
-        raise SystemExit(f"{local_path} not found -- put the merged matrices in --data-dir")
-
-    df = pd.read_csv(local_path, sep="\t")
-    id_cols = list(df.columns[:2])
-
-    # pick 2 real samples from the same study, so the test also confirms
-    # per-study grouping works, not just column selection
-    study_id, _ = Counter(sample_to_study.values()).most_common(1)[0]
-    test_samples = [s for s, st in sample_to_study.items() if st == study_id
-                    and s in df.columns][:2]
-    assert len(test_samples) == 2, f"couldn't find 2 test samples for {study_id}"
-    print(f"testing samples: {test_samples} (study {study_id})")
-
-    split_matrix(local_path, sample_to_study, out_dir)
-    split_df = pd.read_csv(out_dir / out_name(study_id, filename), sep="\t")
-
+    test_samples = [s for s, st in sample_to_study.items() if st == study_id][:2]
     for sample in test_samples:
-        original_col = df.set_index(id_cols[0])[sample]
-        split_col = split_df.set_index(id_cols[0])[sample]
-        pd.testing.assert_series_equal(original_col, split_col, check_names=False)
-        print(f"  {sample}: values match exactly ({len(original_col)} genes)")
-
+        assert _column(src, sample) == _column(out_path, sample), f"{sample}: mismatch"
+        print(f"  {sample}: values match exactly")
     print("end-to-end test OK -- split output matches source for tested samples")
 
 
@@ -280,10 +255,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    # default=None, not a list: argparse validates a list default against
-    # `choices` as a single value and rejects it.
-    parser.add_argument("step", nargs="*", choices=["split", "upload"],
-                        help="Steps to run, in order (default: split)")
+    # No `choices` here: argparse validates a nargs="*" empty default against
+    # `choices` and wrongly rejects it (bpo-9625). Validated in code below.
+    parser.add_argument("step", nargs="*",
+                        help="Steps to run, in order: split, upload (default: split)")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                         help=f"Where the merged matrices live (default: {DEFAULT_DATA_DIR})")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
@@ -307,6 +282,8 @@ def main() -> None:
 
     steps = {"split": cmd_split, "upload": cmd_upload}
     for name in args.step or ["split"]:
+        if name not in steps:
+            raise SystemExit(f"unknown step {name!r} (choose from: split, upload)")
         print(f"== {name} ==")
         steps[name](args)
 

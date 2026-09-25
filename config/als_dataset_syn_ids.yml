@@ -11,3 +11,19 @@ datasets:
     samplesheet_id: syn76551366        # ALS/input/als_samplesheet.csv
     samplesheet_filename: als_samplesheet.csv
     output_folder_id: syn77232836      # ALS/rnaseq_output/
+
+# Inputs for pipeline/1_matrices/split_matrices_by_study.py. Both CSVs live in
+# the aligned_data_raw_nf-core_rnaseq folder (syn77230856); fetched at run time,
+# cached under data/. study_keywords maps each study's dataset_synid (must match
+# the dataset_synid column in dataset_targets.csv) to a short filename slug.
+split_matrices_inputs:
+  dataset_targets_id: syn77364344                 # dataset_targets.csv
+  samplesheet_with_dataset_names_id: syn77364335  # samplesheet_with_dataset_names.csv
+  study_keywords:
+    syn67729513: c9orf72_sporadic_als_ftd
+    syn67719824: grn_ftd_neurovascular
+    syn67754663: tdp43_line_retrotransposon
+    syn67737779: als_molecular_subtypes
+    syn67743547: c9orf72_neurons_glia
+    syn68932658: rna_methylation_tdp43
+    syn67733559: stathmin2_ftd
