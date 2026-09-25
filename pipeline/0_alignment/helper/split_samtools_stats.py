@@ -11,7 +11,7 @@ Uses boto3 per-object copy/delete (server-side, no download). Idempotent: a file
 already at its correct destination is skipped, and the whole step no-ops if the
 folder is already under the limit.
 
-Config (bucket, AWS profile) is read from config/pipeline_config.yml, same as
+Config (bucket, AWS profile) is read from config/aws_s3_config.yml, same as
 orca_rnaseq_workflow.py -- not hardcoded.
 
 Usage:
@@ -27,11 +27,11 @@ from pathlib import Path
 import boto3
 import yaml
 
-CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
-PIPELINE_CONFIG = yaml.safe_load((CONFIG_DIR / "pipeline_config.yml").read_text())
+CONFIG_DIR = Path(__file__).parent.parent.parent.parent / "config"
+AWS_S3_CONFIG = yaml.safe_load((CONFIG_DIR / "aws_s3_config.yml").read_text())
 
-AWS_PROFILE = PIPELINE_CONFIG["aws_profile"]
-BUCKET = PIPELINE_CONFIG["bucket_name"]
+AWS_PROFILE = AWS_S3_CONFIG["aws_profile"]
+BUCKET = AWS_S3_CONFIG["bucket_name"]
 # Default target: the ALS combined run's samtools_stats/. --s3-prefix overrides.
 DEFAULT_S3_PREFIX = f"s3://{BUCKET}/ALS/rnaseq_output/star_rsem/samtools_stats/"
 

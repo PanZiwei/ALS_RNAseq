@@ -45,23 +45,20 @@ from synapseclient import Synapse
 from synapseclient.operations import get as syn_get
 from synapseclient.operations.factory_operations import FileOptions
 
-from split_samtools_stats import split_samtools_stats
+from helper.split_samtools_stats import split_samtools_stats
 
-PARAMS_PATH = Path(__file__).parent / "als_rnaseq_params.json"
-"""Science params only -- input/outdir are computed below, see "_note" key in the JSON."""
-
-CONFIG_PATH = Path(__file__).parent / "nextflow-rnaseq.config"
-
-# Synapse IDs and infra config (bucket, staging keys, AWS profile) live in config/
-# Adding a cohort or changing an ID is a config diff, not a code change. 
-# See config/als_dataset_syn_ids.yml and config/pipeline_config.yml.
+# All config lives in config/ -- adding a cohort or changing an ID/param is a
+# config diff, not a code change. This folder is pure Python.
 CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
 SYN_IDS_PATH = CONFIG_DIR / "als_dataset_syn_ids.yml"
-PIPELINE_CONFIG_PATH = CONFIG_DIR / "pipeline_config.yml"
+AWS_S3_CONFIG_PATH = CONFIG_DIR / "aws_s3_config.yml"
+PARAMS_PATH = CONFIG_DIR / "als_rnaseq_params.json"
+"""Science params only -- input/outdir are computed below, see "_note" key in the JSON."""
+CONFIG_PATH = CONFIG_DIR / "nextflow-rnaseq.config"
 
-PIPELINE_CONFIG = yaml.safe_load(PIPELINE_CONFIG_PATH.read_text())
+AWS_S3_CONFIG = yaml.safe_load(AWS_S3_CONFIG_PATH.read_text())
 
-session = boto3.Session(profile_name=PIPELINE_CONFIG["aws_profile"])
+session = boto3.Session(profile_name=AWS_S3_CONFIG["aws_profile"])
 s3 = session.client("s3")
 
 
@@ -180,11 +177,11 @@ REQUIRED_DATASET_FIELDS = ["name",
 
 
 def generate_datasets() -> list[Dataset]:
-    """Generate list of datasets from config/als_dataset_syn_ids.yml + config/pipeline_config.yml.
+    """Generate list of datasets from config/als_dataset_syn_ids.yml + config/aws_s3_config.yml.
 
     To add another batch/disease later: 
     append another entry to `datasets` in config/als_dataset_syn_ids.yml 
-    (and a matching key under `staging_keys` in config/pipeline_config.yml) 
+    (and a matching key under `staging_keys` in config/aws_s3_config.yml) 
     !! don't make code changes here.
 
     NOTE: per Ram Ayyala the 1,794 ALS samples span 7 source studies and
@@ -193,12 +190,12 @@ def generate_datasets() -> list[Dataset]:
 
     Raises:
         SystemExit: a dataset entry is missing a required field, or has no
-            matching `staging_keys` entry in pipeline_config.yml -- fails
+            matching `staging_keys` entry in aws_s3_config.yml -- fails
             fast here rather than partway through launching Tower workflows.
     """
     syn_ids = yaml.safe_load(SYN_IDS_PATH.read_text())
-    bucket_name = PIPELINE_CONFIG["bucket_name"]
-    staging_keys = PIPELINE_CONFIG["staging_keys"]
+    bucket_name = AWS_S3_CONFIG["bucket_name"]
+    staging_keys = AWS_S3_CONFIG["staging_keys"]
 
     datasets = []
     for entry in syn_ids.get("datasets", []):
@@ -212,7 +209,7 @@ def generate_datasets() -> list[Dataset]:
         name = entry["name"]
         if name not in staging_keys:
             raise SystemExit(
-                f"{PIPELINE_CONFIG_PATH}: no staging_keys entry for dataset "
+                f"{AWS_S3_CONFIG_PATH}: no staging_keys entry for dataset "
                 f"'{name}' (defined in {SYN_IDS_PATH}) -- add one before running"
             )
         staging_key = staging_keys[name]
