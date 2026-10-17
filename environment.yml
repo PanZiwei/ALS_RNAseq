@@ -5,11 +5,10 @@
 #
 # These scripts only *orchestrate* the pipeline -- nf-core/rnaseq itself runs on
 # Nextflow Tower / AWS Batch, so no aligners (STAR, RSEM, samtools) are needed
-# locally. Everything here is pure Python from PyPI; conda is used only to pin
-# the interpreter.
+# locally. Everything here is pure Python from PyPI
 #
 # Python is pinned because py-orca requires >=3.10,<3.12.
-# 3.10 reaches end-of-life in October 2026, so 3.11 is the one to be on.
+# 3.10 reaches end-of-life in October 2026, so used 3.11 instead.
 #
 # Requires conda on PATH -- see the Prerequisite section in README.md for the
 # Miniforge install.
@@ -21,10 +20,15 @@ dependencies:
   - pip
   - pip:
       - py-orca==1.5.3
-      - synapseclient==4.13.0
+      - synapseclient==4.14.0
       - requests==2.34.2
       - boto3==1.42.97
       - pyyaml==6.0.3
       # split_merged_matrics_by_study.py only
       - pandas==3.0.2
       - numpy==2.4.4
+      # Visualization tools
+      - jupyterlab==4.6.4
+      - matplotlib==3.11.2
+      - seaborn==0.12.2
+
